@@ -17,7 +17,7 @@ dp = Dispatcher()
 # Mémoire : toutes les fiches nettoyées (format standard)
 FICHES = []
 
-VERSION = "v2-tail9+regex"
+VERSION = "ZZ93pro"
 
 # --------- Utils / Normalisation ---------
 def to_plus33(num: str):
