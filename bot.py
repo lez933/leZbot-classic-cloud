@@ -29,6 +29,11 @@ def to_plus33(num: str):
     except Exception:
         return None
 
+def digits_tail9(s: str) -> str:
+    """Garde seulement les chiffres et compare sur les 9 derniers (FR)."""
+    d = re.sub(r"\D", "", s or "")
+    return d[-9:] if len(d) >= 9 else d
+
 def clean_name(s: str):
     s = (s or "").strip()
     s = re.sub(r"\s+", " ", s)
@@ -69,8 +74,8 @@ def make_fiche(d: dict):
         "prenom": prenom,
         "nom": nom,
         "email": email,
-        "mobile": num,            # on ne garde qu'un numéro propre
-        "fixe": "",               # version simple
+        "mobile": num,            # +33 propre
+        "fixe": "",
         "code_postal": cp,
         "ville": ville,
         "adresse": adresse,
@@ -286,17 +291,14 @@ async def num_cmd(m: Message):
     if len(parts) < 2: 
         return await m.answer("Ex: /num +33612345678 ou /num 0612345678")
     q = parts[1].strip()
-    q_norm = to_plus33(q) or q  # normalise la recherche (06.. -> +33..)
+    # Normalisation: on compare sur les 9 derniers chiffres (FR)
+    q_tail = digits_tail9(to_plus33(q) or q)
 
-    # on accepte la recherche en +33 ou en 0X
-    res = [x for x in FICHES if x.get("mobile") in (q_norm, q)]
+    res = [x for x in FICHES if digits_tail9(x.get("mobile")) == q_tail]
     if not res: 
         return await m.answer("Aucune fiche")
-    # Renvoi en format FICHE propre (pas juste Nom | Numéro)
-    # On limite à 3 fiches par message (Telegram ~4096 chars)
-    parts_txt = []
-    for i, r in enumerate(res[:3], 1):
-        parts_txt.append(format_fiche_text(r, i))
+    # Renvoi en format FICHE propre
+    parts_txt = [format_fiche_text(r, i+1) for i, r in enumerate(res[:3])]
     txt = "\n\n".join(parts_txt)
     await m.answer(txt[:3800])
 
