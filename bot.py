@@ -202,7 +202,7 @@ def parse_jsonl(path: str):
                 continue
     return out
 
-# --------- Export ---------
+# --------- Export & Affichage ---------
 def export_xlsx(path: str, rows):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     wb = xlsxwriter.Workbook(path)
@@ -216,29 +216,30 @@ def export_xlsx(path: str, rows):
         r += 1
     wb.close()
 
+def format_fiche_text(r, i=None):
+    entete = f"FICHE {i}\n" if i is not None else ""
+    return (
+        entete +
+        "Civilité: " + (r.get('civilite','') or "") + "\n" +
+        "Prénom: " + (r.get('prenom','') or "") + "\n" +
+        "Nom: " + (r.get('nom','') or "") + "\n" +
+        "Date de naissance: " + (r.get('date_naissance','') or "") + "\n" +
+        "Email: " + (r.get('email','') or "") + "\n" +
+        "Mobile: " + (r.get('mobile','') or "") + "\n" +
+        "Téléphone Fixe: " + (r.get('fixe','') or "") + "\n" +
+        "Code Postal: " + (r.get('code_postal','') or "") + "\n" +
+        "Ville: " + (r.get('ville','') or "") + "\n" +
+        "Adresse: " + (r.get('adresse','') or "") + "\n" +
+        "IBAN: " + (r.get('iban','') or "") + "\n" +
+        "BIC: " + (r.get('bic','') or "") + "\n" +
+        "----------------------------------------"
+    )
+
 def export_fiche_txt(path: str, rows):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         for i, r in enumerate(rows, 1):
-            f.write(
-                "\n".join([
-                    f"FICHE {i}",
-                    f"Civilité: {r.get('civilite','')}",
-                    f"Prénom: {r.get('prenom','')}",
-                    f"Nom: {r.get('nom','')}",
-                    f"Date de naissance: {r.get('date_naissance','')}",
-                    f"Email: {r.get('email','')}",
-                    f"Mobile: {r.get('mobile','')}",
-                    f"Téléphone Fixe: {r.get('fixe','')}",
-                    f"Code Postal: {r.get('code_postal','')}",
-                    f"Ville: {r.get('ville','')}",
-                    f"Adresse: {r.get('adresse','')}",
-                    f"IBAN: {r.get('iban','')}",
-                    f"BIC: {r.get('bic','')}",
-                    "-" * 40,
-                    ""
-                ])
-            )
+            f.write(format_fiche_text(r, i) + "\n\n")
 
 # --------- Handlers ---------
 @dp.message(Command("start"))
@@ -285,13 +286,19 @@ async def num_cmd(m: Message):
     if len(parts) < 2: 
         return await m.answer("Ex: /num +33612345678 ou /num 0612345678")
     q = parts[1].strip()
-    q_norm = to_plus33(q) or q  # normalise la recherche
+    q_norm = to_plus33(q) or q  # normalise la recherche (06.. -> +33..)
+
     # on accepte la recherche en +33 ou en 0X
     res = [x for x in FICHES if x.get("mobile") in (q_norm, q)]
     if not res: 
         return await m.answer("Aucune fiche")
-    txt = "\n".join(f"- {x['nom_prenom']} | {x['mobile']}" for x in res[:10])
-    await m.answer(txt)
+    # Renvoi en format FICHE propre (pas juste Nom | Numéro)
+    # On limite à 3 fiches par message (Telegram ~4096 chars)
+    parts_txt = []
+    for i, r in enumerate(res[:3], 1):
+        parts_txt.append(format_fiche_text(r, i))
+    txt = "\n\n".join(parts_txt)
+    await m.answer(txt[:3800])
 
 @dp.message(Command("export"))
 async def export_cmd(m: Message):
