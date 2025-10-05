@@ -17,6 +17,8 @@ dp = Dispatcher()
 # Mémoire : toutes les fiches nettoyées (format standard)
 FICHES = []
 
+VERSION = "v2-tail9+regex"
+
 # --------- Utils / Normalisation ---------
 def to_plus33(num: str):
     if not num:
@@ -44,6 +46,7 @@ def make_fiche(d: dict):
     prenom = clean_name(d.get("prenom") or d.get("firstname") or d.get("first_name"))
     nom    = clean_name(d.get("nom") or d.get("lastname") or d.get("last_name"))
     email  = (d.get("email") or "").strip()
+
     # On accepte plein de clés possibles pour le numéro
     mobile = (
         d.get("mobile") or d.get("phone") or d.get("telephone") or d.get("numero")
@@ -87,6 +90,16 @@ def make_fiche(d: dict):
 
 # --------- Parsers ---------
 SEP_RE = re.compile(r"^\s*[-_=]{5,}\s*$")
+LABEL_RX = re.compile(r"^([^:]+):\s*(.*)$")
+PHONE_FALLBACK_RX = re.compile(r"(?:\+33|0)\s*[1-9](?:[ .-]?\d){8}")
+
+MOBILE_LABELS = {
+    "mobile","téléphone mobile","telephone mobile",
+    "téléphone portable","telephone portable",
+    "portable","téléphone(s)","telephone(s)",
+    "téléphone","telephone","gsm","tel","numéro","numero"
+}
+FIXE_LABELS = {"téléphone fixe","telephone fixe","fixe"}
 
 def parse_fiche_blocks(lines):
     """Fichiers 'fiche' : lignes 'Champ: valeur' + séparateurs -----"""
@@ -100,22 +113,20 @@ def parse_fiche_blocks(lines):
             ln = ln.strip()
             if not ln:
                 continue
-            if ":" in ln:
-                k, v = ln.split(":", 1)
-                m[k.strip().lower()] = v.strip()
+            mo = LABEL_RX.match(ln)
+            if mo:
+                k = mo.group(1).strip().lower()
+                v = mo.group(2).strip()
+                m[k] = v
 
-        # mapping robuste des clés téléphone
-        mobile_raw = (
-            m.get("téléphone mobile") or m.get("telephone mobile") or
-            m.get("téléphone portable") or m.get("telephone portable") or
-            m.get("portable") or m.get("mobile") or
-            m.get("téléphone(s)") or m.get("telephone(s)") or
-            m.get("téléphone") or m.get("telephone")
-        )
-        fixe_raw = (
-            m.get("téléphone fixe") or m.get("telephone fixe") or
-            m.get("fixe")
-        )
+        # Extraire num via labels connus
+        mobile_raw = None
+        fixe_raw = None
+        for k, v in m.items():
+            if k in MOBILE_LABELS and not mobile_raw:
+                mobile_raw = v
+            elif k in FIXE_LABELS and not fixe_raw:
+                fixe_raw = v
 
         fiche = make_fiche({
             "civilite": m.get("civilité") or m.get("civilite"),
@@ -125,17 +136,18 @@ def parse_fiche_blocks(lines):
             "email": m.get("email"),
             "mobile": mobile_raw,
             "fixe": fixe_raw,
-            "code_postal": m.get("code postal") or m.get("code_postal"),
+            "code_postal": m.get("code postal") or m.get("code_postal") or m.get("cp"),
             "ville": m.get("ville"),
-            "adresse": m.get("adresse"),
+            "adresse": m.get("adresse") or m.get("address"),
             "iban": m.get("iban"),
             "bic": m.get("bic") or m.get("swift"),
+            "nom_prenom": (m.get("nom_prenom") or f"{m.get('nom','')} {m.get('prénom') or m.get('prenom') or ''}").strip(),
         })
 
         # Dernier recours : cherche un numéro dans le bloc
         if not fiche.get("mobile"):
             raw = "\n".join(block)
-            cand = re.findall(r"(?:\+33|0)\s*[1-9](?:[ .-]?\d){8}", raw)
+            cand = PHONE_FALLBACK_RX.findall(raw)
             if cand:
                 fiche["mobile"] = to_plus33(cand[0]) or cand[0]
 
@@ -249,7 +261,14 @@ def export_fiche_txt(path: str, rows):
 # --------- Handlers ---------
 @dp.message(Command("start"))
 async def start(m: Message):
-    await m.answer("leZbot-classic est prêt.\nCommandes: /load /count /num /export\nEnvoie-moi un fichier .txt ou .jsonl, je le mets au propre.")
+    await m.answer(f"leZbot-classic {VERSION} prêt.\nCommandes: /load /count /num /export /clear\nEnvoie-moi un fichier .txt ou .jsonl, je le mets au propre.")
+
+@dp.message(Command("clear"))
+async def clear_cmd(m: Message):
+    if ADMIN_ID and m.from_user and m.from_user.id != ADMIN_ID:
+        return await m.answer("Seul l’admin peut /clear")
+    FICHES.clear()
+    await m.answer("Mémoire vidée. Envoie un fichier puis /load.")
 
 # Réception de fichiers envoyés au bot (DM)
 @dp.message(F.document)
@@ -293,6 +312,8 @@ async def num_cmd(m: Message):
     q = parts[1].strip()
     # Normalisation: on compare sur les 9 derniers chiffres (FR)
     q_tail = digits_tail9(to_plus33(q) or q)
+    if not q_tail:
+        return await m.answer("Numéro invalide. Exemple: /num 0612345678")
 
     res = [x for x in FICHES if digits_tail9(x.get("mobile")) == q_tail]
     if not res: 
