@@ -1,11 +1,12 @@
 import asyncio, os, re, json
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, FSInputFile
 from aiogram.filters import Command
 from dotenv import load_dotenv
 import phonenumbers
 import xlsxwriter
 
+# --------- ENV ---------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
@@ -13,14 +14,18 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
+# Mémoire : toutes les fiches nettoyées (format standard)
 FICHES = []
 
+# --------- Utils / Normalisation ---------
 def to_plus33(num: str):
+    if not num:
+        return None
     try:
         n = phonenumbers.parse(num, "FR")
         if not phonenumbers.is_valid_number(n):
             return None
-        return phonenumbers.format_number(n, phonenumbers.PhoneNumberFormat.E164)
+        return phonenumbers.format_number(n, phonenumbers.PhoneNumberFormat.E164)  # +336...
     except Exception:
         return None
 
@@ -29,49 +34,137 @@ def clean_name(s: str):
     s = re.sub(r"\s+", " ", s)
     return s.title()
 
-def normalize(rec: dict):
-    prenom = clean_name(rec.get("prenom") or rec.get("firstname") or rec.get("first_name") or "")
-    nom    = clean_name(rec.get("nom") or rec.get("lastname") or rec.get("last_name") or "")
-    mobile = rec.get("mobile") or rec.get("phone") or rec.get("telephone")
-    fixe   = rec.get("fixe") or rec.get("landline")
+def make_fiche(d: dict):
+    """Retourne une fiche standard 'propre'."""
+    prenom = clean_name(d.get("prenom") or d.get("firstname") or d.get("first_name"))
+    nom    = clean_name(d.get("nom") or d.get("lastname") or d.get("last_name"))
+    email  = (d.get("email") or "").strip()
+    mobile = d.get("mobile") or d.get("phone") or d.get("telephone") or d.get("numero") or d.get("portable")
+    fixe   = d.get("fixe") or d.get("landline") or d.get("tel_fixe")
+    cp     = (d.get("code_postal") or d.get("postalCode") or d.get("cp") or "").strip()
+    ville  = clean_name(d.get("ville") or d.get("city"))
+    adresse= (d.get("adresse") or d.get("address") or "").strip()
+    iban   = (d.get("iban") or "").replace(" ", "")
+    bic    = (d.get("bic") or d.get("swift") or "").replace(" ", "").upper()
+    civil  = (d.get("civilite") or d.get("civility") or "").strip()
+    birth  = (d.get("date_naissance") or d.get("birthDate") or "").strip()
+
+    # Téléphones -> +33
     num = to_plus33(str(mobile)) or to_plus33(str(fixe)) or ""
-    return {"nom": nom, "prenom": prenom, "nom_prenom": (nom + " " + prenom).strip(), "numero": num}
+
+    return {
+        "civilite": civil,
+        "prenom": prenom,
+        "nom": nom,
+        "email": email,
+        "mobile": num,            # on ne garde qu'un numéro propre
+        "fixe": "",               # on peut garder vide dans cette version simple
+        "code_postal": cp,
+        "ville": ville,
+        "adresse": adresse,
+        "iban": iban,
+        "bic": bic,
+        "date_naissance": birth,
+        "nom_prenom": (f"{nom} {prenom}".strip()),
+    }
+
+# --------- Parsers ---------
+SEP_RE = re.compile(r"^\s*[-_=]{5,}\s*$")
+
+def parse_fiche_blocks(lines):
+    """Fichiers 'fiche' avec lignes 'Champ: valeur' et séparateurs -----"""
+    out, block = [], []
+    def flush():
+        if not block: return
+        m = {}
+        for ln in block:
+            ln = ln.strip()
+            if not ln: 
+                continue
+            if ":" in ln:
+                k, v = ln.split(":", 1)
+                m[k.strip().lower()] = v.strip()
+        if m:
+            out.append(make_fiche({
+                "civilite": m.get("civilité") or m.get("civilite"),
+                "prenom": m.get("prénom") or m.get("prenom"),
+                "nom": m.get("nom"),
+                "date_naissance": m.get("date de naissance") or m.get("date_naissance"),
+                "email": m.get("email"),
+                "mobile": m.get("mobile"),
+                "fixe": m.get("téléphone fixe") or m.get("telephone fixe") or m.get("fixe"),
+                "code_postal": m.get("code postal") or m.get("code_postal"),
+                "ville": m.get("ville"),
+                "adresse": m.get("adresse"),
+                "iban": m.get("iban"),
+                "bic": m.get("bic") or m.get("swift"),
+            }))
+    for ln in lines:
+        if SEP_RE.match(ln):
+            flush(); block = []
+        else:
+            block.append(ln)
+    flush()
+    return out
+
+def parse_line_styles(lines):
+    """Lignes brutes : 'Nom;Prenom;Tel' | 'Nom Prenom: 06..' | 'Nom Prenom | +33..' | JSONL"""
+    out = []
+    for s in lines:
+        s = s.strip()
+        if not s: 
+            continue
+        # JSON objet sur une ligne
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                obj = json.loads(s)
+                out.append(make_fiche(obj))
+                continue
+            except Exception:
+                pass
+        # Nom;Prenom;Tel
+        if ";" in s and s.count(";") >= 2:
+            parts = [p.strip() for p in s.split(";")]
+            rec = {"nom": parts[0], "prenom": parts[1], "phone": parts[2]}
+            out.append(make_fiche(rec))
+            continue
+        # Nom Prenom: 06...
+        if ":" in s and re.search(r"\d{6,}", s):
+            k, v = s.split(":", 1)
+            out.append(make_fiche({"nom_prenom": k, "phone": v}))
+            continue
+        # Nom Prenom | +33...
+        if "|" in s and re.search(r"\+?\d{6,}", s):
+            left, right = [x.strip() for x in s.split("|", 1)]
+            out.append(make_fiche({"nom_prenom": left, "numero": right}))
+            continue
+    return out
 
 def parse_txt(path: str):
-    out = []
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            s = line.strip()
-            if not s: continue
-            if ";" in s and s.count(";") >= 2:
-                parts = [p.strip() for p in s.split(";")]
-                rec = {"nom": parts[0], "prenom": parts[1], "phone": parts[2]}
-                out.append(normalize(rec))
-            elif ":" in s:
-                k, v = s.split(":", 1)
-                if re.search(r"\d{6,}", v):
-                    out.append(normalize({"nom": k, "phone": v}))
-            elif s.startswith("{") and s.endswith("}"):
-                try:
-                    obj = json.loads(s)
-                    out.append(normalize(obj))
-                except Exception:
-                    pass
-    return out
+        lines = f.readlines()
+    # d'abord : blocs 'fiche'
+    fiches = parse_fiche_blocks(lines)
+    if fiches:
+        return fiches
+    # sinon : lignes brutes
+    return parse_line_styles(lines)
 
 def parse_jsonl(path: str):
     out = []
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
-            line = line.strip()
-            if not line: continue
+            s = line.strip()
+            if not s:
+                continue
             try:
-                obj = json.loads(line)
-                out.append(normalize(obj))
+                obj = json.loads(s)
+                out.append(make_fiche(obj))
             except Exception:
                 continue
     return out
 
+# --------- Export ---------
 def export_xlsx(path: str, rows):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     wb = xlsxwriter.Workbook(path)
@@ -81,13 +174,48 @@ def export_xlsx(path: str, rows):
     r = 1
     for x in rows:
         ws.write(r, 0, x.get("nom_prenom",""))
-        ws.write(r, 1, x.get("numero",""))
+        ws.write(r, 1, x.get("mobile",""))
         r += 1
     wb.close()
 
+def export_fiche_txt(path: str, rows):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for i, r in enumerate(rows, 1):
+            f.write(
+                "\n".join([
+                    f"FICHE {i}",
+                    f"Civilité: {r.get('civilite','')}",
+                    f"Prénom: {r.get('prenom','')}",
+                    f"Nom: {r.get('nom','')}",
+                    f"Date de naissance: {r.get('date_naissance','')}",
+                    f"Email: {r.get('email','')}",
+                    f"Mobile: {r.get('mobile','')}",
+                    f"Téléphone Fixe: {r.get('fixe','')}",
+                    f"Code Postal: {r.get('code_postal','')}",
+                    f"Ville: {r.get('ville','')}",
+                    f"Adresse: {r.get('adresse','')}",
+                    f"IBAN: {r.get('iban','')}",
+                    f"BIC: {r.get('bic','')}",
+                    "-" * 40,
+                    ""
+                ])
+            )
+
+# --------- Handlers ---------
 @dp.message(Command("start"))
 async def start(m: Message):
-    await m.answer("leZbot-classic (cloud) prêt. Commandes: /load /count /export /num")
+    await m.answer("leZbot-classic est prêt.\nCommandes: /load /count /num /export\nEnvoie-moi un fichier .txt ou .jsonl, je le mets au propre.")
+
+# Réception de fichiers envoyés au bot (DM)
+@dp.message(F.document)
+async def handle_upload(m: Message):
+    fn = m.document.file_name or "upload.txt"
+    out_dir = os.path.join("data", "input")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, fn)
+    await bot.download(m.document, out_path)
+    await m.answer(f"📥 Fichier reçu: {fn}\nEnvoie maintenant /load pour le traiter.")
 
 @dp.message(Command("load"))
 async def load_cmd(m: Message):
@@ -98,43 +226,47 @@ async def load_cmd(m: Message):
     added = 0
     for fn in os.listdir(root):
         p = os.path.join(root, fn)
-        if not os.path.isfile(p): continue
+        if not os.path.isfile(p):
+            continue
         if fn.lower().endswith(".jsonl"):
             rows = parse_jsonl(p)
         else:
             rows = parse_txt(p)
-        valid = [x for x in rows if x.get("numero")]
+        valid = [x for x in rows if x.get("mobile")]
         FICHES.extend(valid)
         added += len(valid)
-    await m.answer(f"Chargé ✅ {added} fiches (+33) — total {len(FICHES)}")
+    await m.answer(f"✅ {added} fiches ajoutées (propre +33). Total: {len(FICHES)}")
 
 @dp.message(Command("count"))
 async def count_cmd(m: Message):
-    await m.answer(f"{len(FICHES)} fiches en mémoire")
+    await m.answer(f"{len(FICHES)} fiches prêtes")
 
 @dp.message(Command("num"))
 async def num_cmd(m: Message):
     parts = (m.text or "").split(maxsplit=1)
-    if len(parts) < 2: return await m.answer("Ex: /num +33612345678")
+    if len(parts) < 2: 
+        return await m.answer("Ex: /num +33612345678")
     q = parts[1].strip()
-    res = [x for x in FICHES if x.get("numero")==q]
-    if not res: return await m.answer("Aucune fiche")
-    txt = "\n".join(f"- {x['nom_prenom']} | {x['numero']}" for x in res[:10])
+    res = [x for x in FICHES if x.get("mobile")==q]
+    if not res: 
+        return await m.answer("Aucune fiche")
+    txt = "\n".join(f"- {x['nom_prenom']} | {x['mobile']}" for x in res[:10])
     await m.answer(txt)
 
 @dp.message(Command("export"))
 async def export_cmd(m: Message):
+    # /export size=500 format=xlsx|txt
     args = (m.text or "")[7:].strip()
     kv = {}
     for part in args.split():
         if "=" in part:
             k, v = part.split("=",1)
-            kv[k]=v
+            kv[k.strip()] = v.strip()
     size = int(kv.get("size","500"))
-    fmt = kv.get("format","xlsx").lower()
+    fmt  = kv.get("format","xlsx").lower()
     rows = FICHES[:size]
     if not rows:
-        return await m.answer("Aucune fiche chargée. Fais /load d’abord.")
+        return await m.answer("Aucune fiche chargée. Envoie un fichier puis /load.")
     out_dir = os.path.join("data","staging")
     os.makedirs(out_dir, exist_ok=True)
     if fmt == "xlsx":
@@ -143,10 +275,8 @@ async def export_cmd(m: Message):
         await m.answer_document(FSInputFile(out), caption=f"XLSX — {len(rows)} lignes")
     else:
         out = os.path.join(out_dir, "export.txt")
-        with open(out,"w",encoding="utf-8") as f:
-            for x in rows:
-                f.write(f"{x['nom_prenom']}|{x['numero']}\n")
-        await m.answer_document(FSInputFile(out), caption=f"TXT — {len(rows)} lignes")
+        export_fiche_txt(out, rows)
+        await m.answer_document(FSInputFile(out), caption=f"TXT — {len(rows)} fiches propres")
 
 async def main():
     await dp.start_polling(bot)
