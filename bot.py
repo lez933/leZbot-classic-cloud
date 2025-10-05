@@ -39,7 +39,12 @@ def make_fiche(d: dict):
     prenom = clean_name(d.get("prenom") or d.get("firstname") or d.get("first_name"))
     nom    = clean_name(d.get("nom") or d.get("lastname") or d.get("last_name"))
     email  = (d.get("email") or "").strip()
-    mobile = d.get("mobile") or d.get("phone") or d.get("telephone") or d.get("numero") or d.get("portable")
+    # On accepte plein de clés possibles pour le numéro
+    mobile = (
+        d.get("mobile") or d.get("phone") or d.get("telephone") or d.get("numero")
+        or d.get("portable") or d.get("téléphone") or d.get("telephone(s)")
+        or d.get("téléphone(s)")
+    )
     fixe   = d.get("fixe") or d.get("landline") or d.get("tel_fixe")
     cp     = (d.get("code_postal") or d.get("postalCode") or d.get("cp") or "").strip()
     ville  = clean_name(d.get("ville") or d.get("city"))
@@ -52,63 +57,96 @@ def make_fiche(d: dict):
     # Téléphones -> +33
     num = to_plus33(str(mobile)) or to_plus33(str(fixe)) or ""
 
+    # Si nom_prenom fourni d'un coup, on le répartit pas: juste le garder en libellé
+    libelle = d.get("nom_prenom")
+    if libelle and not (nom or prenom):
+        nom_prenom = libelle
+    else:
+        nom_prenom = (f"{nom} {prenom}".strip())
+
     return {
         "civilite": civil,
         "prenom": prenom,
         "nom": nom,
         "email": email,
         "mobile": num,            # on ne garde qu'un numéro propre
-        "fixe": "",               # on peut garder vide dans cette version simple
+        "fixe": "",               # version simple
         "code_postal": cp,
         "ville": ville,
         "adresse": adresse,
         "iban": iban,
         "bic": bic,
         "date_naissance": birth,
-        "nom_prenom": (f"{nom} {prenom}".strip()),
+        "nom_prenom": nom_prenom,
     }
 
 # --------- Parsers ---------
 SEP_RE = re.compile(r"^\s*[-_=]{5,}\s*$")
 
 def parse_fiche_blocks(lines):
-    """Fichiers 'fiche' avec lignes 'Champ: valeur' et séparateurs -----"""
+    """Fichiers 'fiche' : lignes 'Champ: valeur' + séparateurs -----"""
     out, block = [], []
     def flush():
-        if not block: return
+        nonlocal block
+        if not block:
+            return
         m = {}
         for ln in block:
             ln = ln.strip()
-            if not ln: 
+            if not ln:
                 continue
             if ":" in ln:
                 k, v = ln.split(":", 1)
                 m[k.strip().lower()] = v.strip()
-        if m:
-            out.append(make_fiche({
-                "civilite": m.get("civilité") or m.get("civilite"),
-                "prenom": m.get("prénom") or m.get("prenom"),
-                "nom": m.get("nom"),
-                "date_naissance": m.get("date de naissance") or m.get("date_naissance"),
-                "email": m.get("email"),
-                "mobile": m.get("mobile"),
-                "fixe": m.get("téléphone fixe") or m.get("telephone fixe") or m.get("fixe"),
-                "code_postal": m.get("code postal") or m.get("code_postal"),
-                "ville": m.get("ville"),
-                "adresse": m.get("adresse"),
-                "iban": m.get("iban"),
-                "bic": m.get("bic") or m.get("swift"),
-            }))
+
+        # mapping robuste des clés téléphone
+        mobile_raw = (
+            m.get("téléphone mobile") or m.get("telephone mobile") or
+            m.get("téléphone portable") or m.get("telephone portable") or
+            m.get("portable") or m.get("mobile") or
+            m.get("téléphone(s)") or m.get("telephone(s)") or
+            m.get("téléphone") or m.get("telephone")
+        )
+        fixe_raw = (
+            m.get("téléphone fixe") or m.get("telephone fixe") or
+            m.get("fixe")
+        )
+
+        fiche = make_fiche({
+            "civilite": m.get("civilité") or m.get("civilite"),
+            "prenom": m.get("prénom") or m.get("prenom"),
+            "nom": m.get("nom"),
+            "date_naissance": m.get("date de naissance") or m.get("date_naissance"),
+            "email": m.get("email"),
+            "mobile": mobile_raw,
+            "fixe": fixe_raw,
+            "code_postal": m.get("code postal") or m.get("code_postal"),
+            "ville": m.get("ville"),
+            "adresse": m.get("adresse"),
+            "iban": m.get("iban"),
+            "bic": m.get("bic") or m.get("swift"),
+        })
+
+        # Dernier recours : cherche un numéro dans le bloc
+        if not fiche.get("mobile"):
+            raw = "\n".join(block)
+            cand = re.findall(r"(?:\+33|0)\s*[1-9](?:[ .-]?\d){8}", raw)
+            if cand:
+                fiche["mobile"] = to_plus33(cand[0]) or cand[0]
+
+        out.append(fiche)
+        block = []
+
     for ln in lines:
         if SEP_RE.match(ln):
-            flush(); block = []
+            flush()
         else:
             block.append(ln)
     flush()
     return out
 
 def parse_line_styles(lines):
-    """Lignes brutes : 'Nom;Prenom;Tel' | 'Nom Prenom: 06..' | 'Nom Prenom | +33..' | JSONL"""
+    """Lignes brutes : 'Nom;Prenom;Tel' | 'Nom Prenom: 06..' | 'Nom Prénom | +33..' | JSONL"""
     out = []
     for s in lines:
         s = s.strip()
@@ -245,9 +283,11 @@ async def count_cmd(m: Message):
 async def num_cmd(m: Message):
     parts = (m.text or "").split(maxsplit=1)
     if len(parts) < 2: 
-        return await m.answer("Ex: /num +33612345678")
+        return await m.answer("Ex: /num +33612345678 ou /num 0612345678")
     q = parts[1].strip()
-    res = [x for x in FICHES if x.get("mobile")==q]
+    q_norm = to_plus33(q) or q  # normalise la recherche
+    # on accepte la recherche en +33 ou en 0X
+    res = [x for x in FICHES if x.get("mobile") in (q_norm, q)]
     if not res: 
         return await m.answer("Aucune fiche")
     txt = "\n".join(f"- {x['nom_prenom']} | {x['mobile']}" for x in res[:10])
